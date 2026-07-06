@@ -8,7 +8,7 @@ echo ""
 
 # 设置应用名称
 APP_NAME="工作助手"
-VERSION="1.0.0"
+VERSION="3.0.0"
 ZIP_NAME="${APP_NAME}_v${VERSION}.zip"
 
 # 创建临时目录

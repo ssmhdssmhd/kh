@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-工作助手应用 - 语音自动记录会议要点、智能总结
+工作助手应用 - 专业开会模式，实时语音识别，精准文字转换
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
+from tkinter import ttk, messagebox, scrolledtext, font as tkfont
 from datetime import datetime, timedelta
 import json
 import os
@@ -13,6 +13,7 @@ import threading
 import time
 from pathlib import Path
 import re
+import sys
 
 try:
     import speech_recognition as sr
@@ -21,10 +22,14 @@ except ImportError:
     SPEECH_AVAILABLE = False
 
 try:
+    import pyaudio
+    PYAUDIO_AVAILABLE = True
+except ImportError:
+    PYAUDIO_AVAILABLE = False
+
+try:
     import nltk
-    from nltk.tokenize import sent_tokenize, word_tokenize
-    from nltk.corpus import stopwords
-    from nltk.probability import FreqDist
+    from nltk.tokenize import sent_tokenize
     NLTK_AVAILABLE = True
 except ImportError:
     NLTK_AVAILABLE = False
@@ -34,144 +39,434 @@ RECORDS_FILE = DATA_DIR / "records.json"
 CONFIG_FILE = DATA_DIR / "config.json"
 
 
-class VoiceRecorder:
-    def __init__(self, callback):
-        self.callback = callback
+class TextProcessor:
+    """文本后处理器 - 提升识别准确率和美观度"""
+    
+    @staticmethod
+    def auto_punctuate(text):
+        """自动添加标点符号"""
+        if not text.strip():
+            return text
+        
+        text = text.strip()
+        
+        patterns = [
+            (r'(今天|明天|昨天|后天|前天|上周|下周|本月|下月|今年|明年)\s*', r'\1，'),
+            (r'(首先|其次|然后|接着|最后|另外|此外|同时|因此|所以)', r'\1，'),
+            (r'(好的|好的好的|明白了|了解了|知道了|收到|对的|是的|没错)', r'\1。'),
+            (r'(谢谢|感谢|非常感谢|辛苦|辛苦了)', r'\1。'),
+            (r'(那么|既然这样|这样的话|所以说|也就是说)', r'\1，'),
+            (r'(等等|之类的|什么的|等等吧|等等啊)', r'\1。'),
+            (r'(吧|呢|啊|吗|嘛|啦|呀|哦|哈|嘿|喂|哎)$', r'\1？'),
+        ]
+        
+        for pattern, replacement in patterns:
+            text = re.sub(pattern, replacement, text)
+        
+        if text and text[-1] not in '。！？，、；：':
+            text += '。'
+        
+        text = re.sub(r'[，。！？、；：]{2,}', lambda m: m.group(0)[-1], text)
+        
+        return text
+    
+    @staticmethod
+    def correct_common_errors(text):
+        """纠正常见的语音识别错误"""
+        corrections = {
+            '的话的': '的话',
+            '然后然后': '然后',
+            '就是就是': '就是',
+            '这个这个': '这个',
+            '那个那个': '那个',
+            '因为因为': '因为',
+            '所以所以': '所以',
+            '但是但是': '但是',
+            '的的': '的',
+            '了了': '了',
+            '着着': '着',
+            '在在': '在',
+            '是是': '是',
+            '有有': '有',
+            '我我': '我',
+            '你你': '你',
+            '他他': '他',
+            '我们我们': '我们',
+            '你们你们': '你们',
+            '他们他们': '他们',
+            '大家大家': '大家',
+            '问题问题': '问题',
+            '事情事情': '事情',
+            '东西东西': '东西',
+            '时间时间': '时间',
+            '现在现在': '现在',
+            '今天今天': '今天',
+            '明天明天': '明天',
+            '工作工作': '工作',
+            '项目项目': '项目',
+            '任务任务': '任务',
+            '计划计划': '计划',
+            '进度进度': '进度',
+            '报告报告': '报告',
+            '会议会议': '会议',
+            '讨论讨论': '讨论',
+            '沟通沟通': '沟通',
+            '协调协调': '协调',
+            '安排安排': '安排',
+            '落实落实': '落实',
+            '执行执行': '执行',
+            '完成完成': '完成',
+            '准备准备': '准备',
+            '开始开始': '开始',
+            '结束结束': '结束',
+            '进行进行': '进行',
+        }
+        
+        for wrong, right in corrections.items():
+            text = text.replace(wrong, right)
+        
+        return text
+    
+    @staticmethod
+    def format_paragraph(text):
+        """格式化段落，使其更美观易读"""
+        if not text.strip():
+            return text
+        
+        sentences = re.split(r'([。！？])', text)
+        result = []
+        current_paragraph = ''
+        
+        for i, part in enumerate(sentences):
+            if part in '。！？':
+                current_paragraph += part
+                if len(current_paragraph) > 50:
+                    result.append(current_paragraph.strip())
+                    current_paragraph = ''
+            else:
+                current_paragraph += part
+        
+        if current_paragraph.strip():
+            result.append(current_paragraph.strip())
+        
+        return '\n\n'.join(result)
+    
+    @staticmethod
+    def remove_filler_words(text):
+        """去除语气词和填充词"""
+        fillers = [
+            '嗯', '呃', '啊', '哦', '哈', '嘿', '喂', '哎', '唉',
+            '那个', '这个', '就是说', '怎么说呢', '然后呢', '就是',
+            '其实呢', '说白了', '简单来说', '总的来说',
+        ]
+        
+        for filler in fillers:
+            text = re.sub(rf'{filler}[，。！？、]?', '', text)
+        
+        return text
+    
+    @staticmethod
+    def process_text(text, remove_fillers=False):
+        """完整的文本处理流程"""
+        if not text.strip():
+            return text
+        
+        text = TextProcessor.correct_common_errors(text)
+        text = TextProcessor.auto_punctuate(text)
+        if remove_fillers:
+            text = TextProcessor.remove_filler_words(text)
+        text = TextProcessor.correct_common_errors(text)
+        
+        return text
+
+
+class SubtitleDisplay:
+    """实时字幕显示组件"""
+    
+    def __init__(self, parent, max_lines=5):
+        self.parent = parent
+        self.max_lines = max_lines
+        self.lines = []
+        
+        self.frame = tk.Frame(parent, bg='#1a1a2e')
+        self.frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.subtitle_frame = tk.Frame(self.frame, bg='#1a1a2e')
+        self.subtitle_frame.pack(fill=tk.X, pady=20)
+        
+        self.labels = []
+        for i in range(max_lines):
+            label = tk.Label(
+                self.subtitle_frame,
+                text='',
+                font=('Microsoft YaHei UI', 18, 'bold'),
+                fg='white',
+                bg='#1a1a2e',
+                wraplength=900,
+                justify='center'
+            )
+            label.pack(pady=3)
+            self.labels.append(label)
+    
+    def add_line(self, text):
+        """添加一行字幕"""
+        self.lines.append(text)
+        if len(self.lines) > self.max_lines:
+            self.lines.pop(0)
+        
+        for i, label in enumerate(self.labels):
+            if i < len(self.lines):
+                label.config(text=self.lines[len(self.lines) - 1 - i])
+            else:
+                label.config(text='')
+    
+    def clear(self):
+        """清空字幕"""
+        self.lines = []
+        for label in self.labels:
+            label.config(text='')
+
+
+class MeetingRecorder:
+    """专业会议录音器"""
+    
+    def __init__(self, text_callback, subtitle_callback):
+        self.text_callback = text_callback
+        self.subtitle_callback = subtitle_callback
         self.is_recording = False
-        self.recognizer = sr.Recognizer()
-        self.microphone = sr.Microphone()
+        self.recognizer = None
+        self.microphone = None
         self.recording_thread = None
-        self.text_buffer = []
+        self.full_text = []
+        self.current_text = ''
+        
+        if SPEECH_AVAILABLE:
+            self.recognizer = sr.Recognizer()
+            self.recognizer.energy_threshold = 300
+            self.recognizer.dynamic_energy_threshold = True
+            self.recognizer.pause_threshold = 0.8
+            self.recognizer.phrase_threshold = 0.3
+            self.recognizer.non_speaking_duration = 0.5
+            
+            try:
+                self.microphone = sr.Microphone()
+            except Exception as e:
+                print(f"麦克风初始化失败: {e}")
+                self.microphone = None
     
     def start_recording(self):
-        if not SPEECH_AVAILABLE:
-            raise ImportError("请安装 speech_recognition 库")
+        """开始录音"""
+        if not SPEECH_AVAILABLE or not self.microphone:
+            raise Exception("语音识别不可用，请安装 SpeechRecognition 和 pyaudio")
         
         self.is_recording = True
-        self.text_buffer = []
+        self.full_text = []
+        self.current_text = ''
         
         def record_loop():
             with self.microphone as source:
-                self.recognizer.adjust_for_ambient_noise(source)
+                self.recognizer.adjust_for_ambient_noise(source, duration=1)
+                
                 while self.is_recording:
                     try:
-                        audio = self.recognizer.listen(source, timeout=3, phrase_time_limit=15)
-                        text = self.recognizer.recognize_google(audio, language='zh-CN')
-                        self.text_buffer.append(text)
-                        if self.callback:
-                            self.callback(text)
+                        audio = self.recognizer.listen(
+                            source,
+                            timeout=5,
+                            phrase_time_limit=10
+                        )
+                        
+                        try:
+                            text = self.recognizer.recognize_google(
+                                audio,
+                                language='zh-CN',
+                                show_all=False
+                            )
+                            
+                            if text and len(text.strip()) > 0:
+                                processed_text = TextProcessor.process_text(text.strip())
+                                
+                                timestamp = datetime.now().strftime("%H:%M:%S")
+                                self.full_text.append({
+                                    'time': timestamp,
+                                    'text': text.strip(),
+                                    'processed': processed_text
+                                })
+                                
+                                if self.text_callback:
+                                    self.text_callback(timestamp, text.strip(), processed_text)
+                                
+                                if self.subtitle_callback:
+                                    self.subtitle_callback(processed_text)
+                        
+                        except sr.UnknownValueError:
+                            continue
+                        except sr.RequestError as e:
+                            print(f"API请求错误: {e}")
+                            time.sleep(2)
+                        except Exception as e:
+                            print(f"识别错误: {e}")
+                            time.sleep(1)
+                            
                     except sr.WaitTimeoutError:
                         continue
-                    except sr.UnknownValueError:
-                        continue
                     except Exception as e:
-                        print(f"语音识别错误: {e}")
+                        print(f"监听错误: {e}")
                         time.sleep(1)
+                        if not self.is_recording:
+                            break
         
         self.recording_thread = threading.Thread(target=record_loop, daemon=True)
         self.recording_thread.start()
     
     def stop_recording(self):
+        """停止录音"""
         self.is_recording = False
         if self.recording_thread:
-            self.recording_thread.join(timeout=2)
-        return "\n".join(self.text_buffer)
+            self.recording_thread.join(timeout=3)
+        return self.get_full_text()
     
-    def get_buffer(self):
-        return "\n".join(self.text_buffer)
+    def get_full_text(self):
+        """获取完整文本"""
+        return self.full_text
+    
+    def get_processed_text(self):
+        """获取处理后的文本"""
+        return '\n'.join([item['processed'] for item in self.full_text])
+    
+    def get_raw_text(self):
+        """获取原始文本"""
+        return '\n'.join([item['text'] for item in self.full_text])
 
 
 class MeetingSummarizer:
+    """会议总结器"""
+    
     @staticmethod
-    def extract_keywords(text, num_keywords=10):
+    def extract_keywords(text, num_keywords=15):
         if not text.strip():
             return []
         
         try:
             if NLTK_AVAILABLE:
                 nltk.download('punkt', quiet=True)
-                nltk.download('stopwords', quiet=True)
+                tokens = nltk.word_tokenize(text)
+                stop_words = set(['的', '是', '在', '有', '和', '了', '我', '你', '他', '她', '它', 
+                                  '这', '那', '们', '都', '就', '而', '及', '与', '等', '能', 
+                                  '会', '要', '可以', '应该', '必须', '一个', '我们', '你们',
+                                  '他们', '因为', '所以', '但是', '然后', '就是', '这个', '那个'])
+                filtered_tokens = [token for token in tokens 
+                                   if len(token) >= 2 and token not in stop_words and '\u4e00' <= token[0] <= '\u9fff']
                 
-                tokens = word_tokenize(text)
-                stop_words = set(stopwords.words('chinese'))
-                filtered_tokens = [token for token in tokens if token.isalnum() and token not in stop_words]
-                
-                freq_dist = FreqDist(filtered_tokens)
+                freq_dist = nltk.FreqDist(filtered_tokens)
                 keywords = [word for word, freq in freq_dist.most_common(num_keywords)]
                 return keywords
-            else:
-                return MeetingSummarizer._simple_keyword_extraction(text, num_keywords)
         except:
-            return MeetingSummarizer._simple_keyword_extraction(text, num_keywords)
+            pass
+        
+        return MeetingSummarizer._simple_keyword_extraction(text, num_keywords)
     
     @staticmethod
-    def _simple_keyword_extraction(text, num_keywords=10):
+    def _simple_keyword_extraction(text, num_keywords=15):
         word_counts = {}
+        stop_words = {'的', '是', '在', '有', '和', '了', '我', '你', '他', '她', '它', 
+                      '这', '那', '们', '都', '就', '而', '及', '与', '等', '能', 
+                      '会', '要', '可以', '应该', '必须', '一个', '我们', '你们',
+                      '他们', '因为', '所以', '但是', '然后', '就是', '这个', '那个'}
+        
         for word in re.findall(r'[\u4e00-\u9fff]{2,}', text):
-            if word not in ['的', '是', '在', '有', '和', '了', '我', '你', '他', '她', '它', '这', '那', '们', '都', '就', '而', '及', '与', '等', '能', '会', '要', '可以', '应该', '必须']:
+            if word not in stop_words:
                 word_counts[word] = word_counts.get(word, 0) + 1
         
         sorted_words = sorted(word_counts.items(), key=lambda x: x[1], reverse=True)
         return [word for word, count in sorted_words[:num_keywords]]
     
     @staticmethod
-    def summarize(text, max_sentences=5):
+    def summarize(text, max_sentences=8):
         if not text.strip():
             return "暂无内容"
         
-        sentences = sent_tokenize(text) if NLTK_AVAILABLE else text.split('。')
-        sentences = [s.strip() for s in sentences if s.strip()]
+        sentences = re.split(r'([。！？])', text)
+        result = []
+        current = ''
         
-        if len(sentences) <= max_sentences:
+        for part in sentences:
+            if part in '。！？':
+                current += part
+                if current.strip():
+                    result.append(current.strip())
+                current = ''
+            else:
+                current += part
+        
+        if current.strip():
+            result.append(current.strip())
+        
+        if len(result) <= max_sentences:
             return text
         
-        scores = []
         keywords = set(MeetingSummarizer.extract_keywords(text, 20))
         
-        for i, sentence in enumerate(sentences):
+        scores = []
+        for i, sentence in enumerate(result):
             score = 0
             sentence_words = set(re.findall(r'[\u4e00-\u9fff]{2,}', sentence))
             for keyword in keywords:
                 if keyword in sentence_words:
                     score += 1
-            score += 1 / (1 + i)
+            
+            position_bonus = 1.0 / (1.0 + i * 0.5)
+            score += position_bonus
+            
+            length = len(sentence)
+            if 20 <= length <= 100:
+                score += 0.5
+            
             scores.append((i, score))
         
         scores.sort(key=lambda x: x[1], reverse=True)
         selected_indices = sorted([i for i, score in scores[:max_sentences]])
         
-        summary = "。".join([sentences[i] for i in selected_indices])
-        if summary and not summary.endswith('。'):
-            summary += '。'
-        
+        summary = ''.join([result[i] for i in selected_indices])
         return summary
     
     @staticmethod
     def extract_action_items(text):
         patterns = [
-            r'(需要|必须|应该|要|得|务必)\s*(做|完成|处理|解决|提交|跟进|落实)\s*([^\。\？\！]+)',
-            r'(负责|承担)\s*([^\。\？\！]+)',
-            r'(时间|期限|截止)\s*([^\。\？\！]+)',
-            r'(下一步|接下来|随后)\s*(做|进行|讨论)\s*([^\。\？\！]+)',
+            (r'(需要|必须|应该|得|务必|一定要)\s*(做|完成|处理|解决|提交|跟进|落实|准备|讨论|确认)\s*([^。！？\n]+)', '需要'),
+            (r'(负责|承担|主导|牵头)\s*([^。！？\n]+)', '负责'),
+            (r'(截止|限期|最晚|最迟)\s*([^。！？\n]+)', '时间'),
+            (r'(下一步|接下来|随后|之后)\s*(要|做|进行|讨论|考虑)\s*([^。！？\n]+)', '下一步'),
+            (r'(希望|期望|期待|要求)\s*([^。！？\n]+)', '期望'),
+            (r'(注意|关注|重视|留意)\s*([^。！？\n]+)', '注意'),
         ]
         
         action_items = []
-        for pattern in patterns:
+        for pattern, category in patterns:
             matches = re.findall(pattern, text)
             for match in matches:
                 item = ''.join(str(m) for m in match).strip()
-                if item and item not in action_items:
-                    action_items.append(item)
+                if item and len(item) > 3 and item not in [a['text'] for a in action_items]:
+                    action_items.append({
+                        'text': item,
+                        'category': category
+                    })
         
-        return action_items[:10]
+        return action_items[:15]
 
 
 class WorkAssistant:
     def __init__(self, root):
         self.root = root
-        self.root.title("工作助手 - 语音自动记录会议")
-        self.root.geometry("1200x800")
+        self.root.title("工作助手 - 专业开会模式")
+        self.root.geometry("1400x900")
         self.root.resizable(True, True)
+        self.root.configure(bg='#f0f2f5')
+        
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure('TNotebook', background='#f0f2f5', tabposition='n')
+        style.configure('TNotebook.Tab', padding=[20, 10], font=('Microsoft YaHei UI', 10))
+        style.map('TNotebook.Tab', background=[('selected', '#1890ff')], foreground=[('selected', 'white')])
         
         DATA_DIR.mkdir(exist_ok=True)
         
@@ -181,9 +476,9 @@ class WorkAssistant:
         self.reminder_running = True
         self.reminder_thread = None
         
-        self.voice_recorder = None
-        self.is_recording = False
-        self.recording_text = ""
+        self.meeting_recorder = None
+        self.is_meeting_mode = False
+        self.meeting_start_time = None
         
         self.create_widgets()
         self.start_reminder_service()
@@ -227,296 +522,598 @@ class WorkAssistant:
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
-        self.create_meeting_tab()
+        self.create_meeting_mode_tab()
+        self.create_meeting_history_tab()
         self.create_work_tab()
         self.create_detail_tab()
         self.create_improvement_tab()
         self.create_reminder_tab()
-        
-        self.create_status_bar()
     
-    def create_meeting_tab(self):
-        frame = ttk.Frame(self.notebook)
-        self.notebook.add(frame, text="🎤 会议录音")
+    def create_meeting_mode_tab(self):
+        """创建专业开会模式标签页"""
+        frame = tk.Frame(self.notebook, bg='#f0f2f5')
+        self.notebook.add(frame, text="🎯 开会模式")
         
-        toolbar_frame = ttk.Frame(frame)
-        toolbar_frame.pack(fill=tk.X, padx=10, pady=5)
+        # 顶部控制栏
+        control_frame = tk.Frame(frame, bg='white', height=70)
+        control_frame.pack(fill=tk.X, padx=10, pady=10)
+        control_frame.pack_propagate(False)
         
-        self.recording_status = ttk.Label(toolbar_frame, text="就绪", foreground="green")
-        self.recording_status.pack(side=tk.LEFT, padx=5)
+        # 会议主题输入
+        tk.Label(control_frame, text="会议主题:", font=('Microsoft YaHei UI', 11), 
+                bg='white', fg='#333').pack(side=tk.LEFT, padx=10, pady=20)
+        self.meeting_theme = tk.Entry(control_frame, width=30, font=('Microsoft YaHei UI', 11),
+                                      relief=tk.FLAT, bg='#f6f6f6')
+        self.meeting_theme.pack(side=tk.LEFT, padx=5, pady=20, ipady=5)
         
-        self.record_btn = ttk.Button(toolbar_frame, text="🔴 开始录音", command=self.toggle_recording)
-        self.record_btn.pack(side=tk.LEFT, padx=5)
+        # 参会人员
+        tk.Label(control_frame, text="参会人员:", font=('Microsoft YaHei UI', 11), 
+                bg='white', fg='#333').pack(side=tk.LEFT, padx=10, pady=20)
+        self.meeting_attendees_input = tk.Entry(control_frame, width=25, font=('Microsoft YaHei UI', 11),
+                                                relief=tk.FLAT, bg='#f6f6f6')
+        self.meeting_attendees_input.pack(side=tk.LEFT, padx=5, pady=20, ipady=5)
         
-        ttk.Button(toolbar_frame, text="📝 自动总结", command=self.auto_summarize).pack(side=tk.LEFT, padx=5)
-        ttk.Button(toolbar_frame, text="💾 保存记录", command=self.save_meeting).pack(side=tk.LEFT, padx=5)
-        ttk.Button(toolbar_frame, text="🗑️ 清空内容", command=self.clear_meeting).pack(side=tk.LEFT, padx=5)
+        # 状态标签
+        self.meeting_status = tk.Label(control_frame, text="● 待机", 
+                                      font=('Microsoft YaHei UI', 12, 'bold'),
+                                      bg='white', fg='#999')
+        self.meeting_status.pack(side=tk.RIGHT, padx=15, pady=20)
         
-        main_frame = ttk.Frame(frame)
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        # 开始/停止按钮
+        self.start_meeting_btn = tk.Button(
+            control_frame, text="🎙️ 开始会议", font=('Microsoft YaHei UI', 12, 'bold'),
+            bg='#1890ff', fg='white', activebackground='#40a9ff',
+            activeforeground='white', relief=tk.FLAT, cursor='hand2',
+            command=self.toggle_meeting, width=12, height=2
+        )
+        self.start_meeting_btn.pack(side=tk.RIGHT, padx=10, pady=12)
         
-        left_frame = ttk.LabelFrame(main_frame, text="🎙️ 语音转文字")
-        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
+        # 计时显示
+        self.timer_label = tk.Label(control_frame, text="00:00:00", 
+                                   font=('Consolas', 18, 'bold'),
+                                   bg='white', fg='#1890ff')
+        self.timer_label.pack(side=tk.RIGHT, padx=20, pady=15)
         
-        self.transcribed_text = scrolledtext.ScrolledText(left_frame, width=40, height=25, font=('Arial', 11))
-        self.transcribed_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        # 主内容区 - 三栏布局
+        main_container = tk.Frame(frame, bg='#f0f2f5')
+        main_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         
-        middle_frame = ttk.LabelFrame(main_frame, text="📊 自动总结")
-        middle_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
+        # 左侧 - 完整记录
+        left_panel = tk.LabelFrame(main_container, text="📝 完整会议记录", 
+                                  font=('Microsoft YaHei UI', 11, 'bold'),
+                                  bg='white', fg='#333', padx=10, pady=10)
+        left_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
         
-        self.summary_text = scrolledtext.ScrolledText(middle_frame, width=40, height=25, font=('Arial', 11))
-        self.summary_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.full_transcript = scrolledtext.ScrolledText(
+            left_panel, font=('Microsoft YaHei UI', 11), wrap=tk.WORD,
+            bg='#fafafa', relief=tk.FLAT, padx=10, pady=10
+        )
+        self.full_transcript.pack(fill=tk.BOTH, expand=True)
         
-        right_frame = ttk.LabelFrame(main_frame, text="⭐ 重点提取")
-        right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
+        # 中间 - 实时字幕
+        center_panel = tk.LabelFrame(main_container, text="🎬 实时字幕", 
+                                    font=('Microsoft YaHei UI', 11, 'bold'),
+                                    bg='white', fg='#333', padx=10, pady=10)
+        center_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
         
-        self.keyword_frame = ttk.LabelFrame(right_frame, text="🔑 关键词")
-        self.keyword_frame.pack(fill=tk.X, padx=5, pady=5)
+        self.subtitle_display = SubtitleDisplay(center_panel, max_lines=5)
+        
+        # 右侧 - 智能分析
+        right_panel = tk.LabelFrame(main_container, text="🤖 智能分析", 
+                                   font=('Microsoft YaHei UI', 11, 'bold'),
+                                   bg='white', fg='#333', padx=10, pady=10)
+        right_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
+        
+        # 关键词区
+        keyword_frame = tk.LabelFrame(right_panel, text="🔑 关键词", 
+                                     font=('Microsoft YaHei UI', 10, 'bold'),
+                                     bg='white', fg='#666')
+        keyword_frame.pack(fill=tk.X, pady=5)
+        
+        self.keywords_container = tk.Frame(keyword_frame, bg='white')
+        self.keywords_container.pack(fill=tk.X, padx=5, pady=5)
         self.keyword_labels = []
         
-        action_frame = ttk.LabelFrame(right_frame, text="✅ 行动项")
-        action_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        self.action_text = scrolledtext.ScrolledText(action_frame, width=35, height=12, font=('Arial', 10))
-        self.action_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        # 行动项区
+        action_frame = tk.LabelFrame(right_panel, text="✅ 行动项", 
+                                    font=('Microsoft YaHei UI', 10, 'bold'),
+                                    bg='white', fg='#666')
+        action_frame.pack(fill=tk.BOTH, expand=True, pady=5)
         
-        # 会议信息输入
-        info_frame = ttk.LabelFrame(frame, text="会议信息")
-        info_frame.pack(fill=tk.X, padx=10, pady=5)
+        self.action_items_text = scrolledtext.ScrolledText(
+            action_frame, font=('Microsoft YaHei UI', 10), wrap=tk.WORD,
+            bg='#fafafa', relief=tk.FLAT, padx=5, pady=5, height=10
+        )
+        self.action_items_text.pack(fill=tk.BOTH, expand=True)
         
-        ttk.Label(info_frame, text="会议主题:").grid(row=0, column=0, padx=5, pady=3, sticky=tk.W)
-        self.meeting_title = ttk.Entry(info_frame, width=30)
-        self.meeting_title.grid(row=0, column=1, padx=5, pady=3, sticky=tk.W)
+        # 底部操作栏
+        bottom_frame = tk.Frame(frame, bg='white', height=60)
+        bottom_frame.pack(fill=tk.X, padx=10, pady=10)
+        bottom_frame.pack_propagate(False)
         
-        ttk.Label(info_frame, text="会议时间:").grid(row=0, column=2, padx=5, pady=3, sticky=tk.W)
-        self.meeting_time = ttk.Entry(info_frame, width=20)
-        self.meeting_time.insert(0, datetime.now().strftime("%Y-%m-%d %H:%M"))
-        self.meeting_time.grid(row=0, column=3, padx=5, pady=3, sticky=tk.W)
+        tk.Button(bottom_frame, text="📊 生成总结", font=('Microsoft YaHei UI', 10),
+                 bg='#52c41a', fg='white', relief=tk.FLAT, cursor='hand2',
+                 command=self.generate_summary, width=12, height=2
+                 ).pack(side=tk.RIGHT, padx=10, pady=10)
         
-        ttk.Label(info_frame, text="参会人员:").grid(row=0, column=4, padx=5, pady=3, sticky=tk.W)
-        self.meeting_attendees = ttk.Entry(info_frame, width=25)
-        self.meeting_attendees.grid(row=0, column=5, padx=5, pady=3, sticky=tk.W)
+        tk.Button(bottom_frame, text="💾 保存会议", font=('Microsoft YaHei UI', 10),
+                 bg='#fa8c16', fg='white', relief=tk.FLAT, cursor='hand2',
+                 command=self.save_current_meeting, width=12, height=2
+                 ).pack(side=tk.RIGHT, padx=10, pady=10)
         
-        # 历史记录列表
-        list_frame = ttk.LabelFrame(frame, text="历史会议记录")
-        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-        
-        columns = ("time", "title", "attendees")
-        self.meeting_tree = ttk.Treeview(list_frame, columns=columns, show="headings", height=6)
-        self.meeting_tree.heading("time", text="时间")
-        self.meeting_tree.heading("title", text="主题")
-        self.meeting_tree.heading("attendees", text="参会人员")
-        self.meeting_tree.column("time", width=150)
-        self.meeting_tree.column("title", width=350)
-        self.meeting_tree.column("attendees", width=200)
-        
-        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.meeting_tree.yview)
-        self.meeting_tree.configure(yscrollcommand=scrollbar.set)
-        
-        self.meeting_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        self.meeting_tree.bind("<<TreeviewSelect>>", self.show_meeting_detail)
-        self.meeting_tree.bind("<Double-1>", self.delete_meeting)
-        
-        self.refresh_meeting_list()
+        tk.Button(bottom_frame, text="🗑️ 清空内容", font=('Microsoft YaHei UI', 10),
+                 bg='#ff4d4f', fg='white', relief=tk.FLAT, cursor='hand2',
+                 command=self.clear_meeting, width=12, height=2
+                 ).pack(side=tk.RIGHT, padx=10, pady=10)
     
-    def on_voice_recognized(self, text):
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self.transcribed_text.insert(tk.END, f"[{timestamp}] {text}\n")
-        self.transcribed_text.see(tk.END)
-        self.recording_text += text + "\n"
+    def on_text_recognized(self, timestamp, raw_text, processed_text):
+        """语音识别回调"""
+        def update():
+            self.full_transcript.insert(tk.END, f"[{timestamp}] ", 'time_tag')
+            self.full_transcript.insert(tk.END, f"{processed_text}\n\n", 'content_tag')
+            self.full_transcript.see(tk.END)
+            
+            full_text = self.full_transcript.get("1.0", tk.END)
+            if len(full_text) > 200:
+                self.update_analysis()
         
-        if len(self.recording_text) > 50:
-            self.auto_summarize()
+        self.root.after(0, update)
     
-    def toggle_recording(self):
+    def on_subtitle(self, text):
+        """字幕回调"""
+        def update():
+            self.subtitle_display.add_line(text)
+        
+        self.root.after(0, update)
+    
+    def toggle_meeting(self):
+        """开始/停止会议"""
         if not SPEECH_AVAILABLE:
-            messagebox.showwarning("警告", "语音识别功能不可用，请安装 speech_recognition 库:\npip install SpeechRecognition pyaudio")
+            messagebox.showwarning(
+                "功能不可用", 
+                "语音识别功能未安装！\n\n请执行以下命令安装：\n"
+                "pip install SpeechRecognition pyaudio\n\n"
+                "macOS用户还需要安装：brew install portaudio"
+            )
             return
         
-        if not self.is_recording:
+        if not self.is_meeting_mode:
             try:
-                self.voice_recorder = VoiceRecorder(self.on_voice_recognized)
-                self.voice_recorder.start_recording()
-                self.is_recording = True
-                self.record_btn.config(text="⏹️ 停止录音")
-                self.recording_status.config(text="录音中...", foreground="red")
-                self.recording_text = ""
-                messagebox.showinfo("开始录音", "录音已开始，请说话...")
+                self.meeting_recorder = MeetingRecorder(
+                    self.on_text_recognized,
+                    self.on_subtitle
+                )
+                self.meeting_recorder.start_recording()
+                self.is_meeting_mode = True
+                self.meeting_start_time = datetime.now()
+                
+                self.start_meeting_btn.config(text="⏹️ 结束会议", bg='#ff4d4f', activebackground='#ff7875')
+                self.meeting_status.config(text="● 录音中", fg='#52c41a')
+                
+                self.subtitle_display.clear()
+                self.start_timer()
+                
+                messagebox.showinfo("会议开始", "会议录音已开始，请开始讲话！\n\n系统将实时转写并智能分析。")
+                
             except Exception as e:
-                messagebox.showerror("错误", f"无法启动录音: {str(e)}\n\n可能原因:\n1. 未安装 pyaudio\n2. 麦克风权限问题")
-                self.is_recording = False
+                messagebox.showerror("错误", f"无法启动会议录音：\n{str(e)}\n\n请检查麦克风是否正常连接。")
+                self.is_meeting_mode = False
         else:
-            self.is_recording = False
-            if self.voice_recorder:
-                self.voice_recorder.stop_recording()
-            self.record_btn.config(text="🔴 开始录音")
-            self.recording_status.config(text="录音结束", foreground="blue")
+            self.is_meeting_mode = False
+            self.stop_timer()
             
-            if self.recording_text.strip():
-                self.auto_summarize()
-                messagebox.showinfo("录音完成", "语音转文字已完成，已自动生成总结！")
-            else:
-                messagebox.showinfo("录音完成", "未识别到语音内容")
+            if self.meeting_recorder:
+                self.meeting_recorder.stop_recording()
+            
+            self.start_meeting_btn.config(text="🎙️ 开始会议", bg='#1890ff', activebackground='#40a9ff')
+            self.meeting_status.config(text="● 已结束", fg='#fa8c16')
+            
+            self.update_analysis()
+            messagebox.showinfo("会议结束", "会议录音已结束！\n\n已生成完整记录和智能分析，请查看。")
     
-    def auto_summarize(self):
-        full_text = self.transcribed_text.get("1.0", tk.END).strip()
+    def start_timer(self):
+        """启动计时器"""
+        self.timer_running = True
+        
+        def update_timer():
+            if self.timer_running and self.meeting_start_time:
+                elapsed = datetime.now() - self.meeting_start_time
+                hours = int(elapsed.total_seconds() // 3600)
+                minutes = int((elapsed.total_seconds() % 3600) // 60)
+                seconds = int(elapsed.total_seconds() % 60)
+                self.timer_label.config(text=f"{hours:02d}:{minutes:02d}:{seconds:02d}")
+                self.root.after(1000, update_timer)
+        
+        update_timer()
+    
+    def stop_timer(self):
+        """停止计时器"""
+        self.timer_running = False
+    
+    def update_analysis(self):
+        """更新智能分析"""
+        full_text = self.full_transcript.get("1.0", tk.END).strip()
         
         if not full_text:
-            messagebox.showwarning("警告", "没有内容可以总结")
             return
         
-        summary = MeetingSummarizer.summarize(full_text)
-        keywords = MeetingSummarizer.extract_keywords(full_text)
+        keywords = MeetingSummarizer.extract_keywords(full_text, 12)
         actions = MeetingSummarizer.extract_action_items(full_text)
-        
-        self.summary_text.delete("1.0", tk.END)
-        self.summary_text.insert(tk.END, summary)
         
         for label in self.keyword_labels:
             label.destroy()
         self.keyword_labels = []
         
         if keywords:
-            for keyword in keywords[:8]:
-                label = ttk.Label(self.keyword_frame, text=f"● {keyword}", 
-                                foreground="#2E7D32", font=('Arial', 10, 'bold'))
-                label.pack(side=tk.LEFT, padx=3, pady=2)
+            for keyword in keywords[:10]:
+                label = tk.Label(
+                    self.keywords_container, text=keyword,
+                    font=('Microsoft YaHei UI', 9, 'bold'),
+                    fg='#1890ff', bg='#e6f7ff',
+                    padx=8, pady=3, cursor='hand2'
+                )
+                label.pack(side=tk.LEFT, padx=3, pady=3)
                 self.keyword_labels.append(label)
         
-        self.action_text.delete("1.0", tk.END)
+        self.action_items_text.delete("1.0", tk.END)
         if actions:
             for i, action in enumerate(actions, 1):
-                self.action_text.insert(tk.END, f"{i}. {action}\n")
+                category = action.get('category', '')
+                text = action.get('text', '')
+                self.action_items_text.insert(tk.END, f"{i}. [{category}] {text}\n\n")
         else:
-            self.action_text.insert(tk.END, "未识别到行动项")
+            self.action_items_text.insert(tk.END, "暂未识别到行动项")
     
-    def save_meeting(self):
-        title = self.meeting_title.get().strip() or "未命名会议"
-        time_str = self.meeting_time.get().strip()
-        attendees = self.meeting_attendees.get().strip()
-        full_text = self.transcribed_text.get("1.0", tk.END).strip()
-        summary = self.summary_text.get("1.0", tk.END).strip()
+    def generate_summary(self):
+        """生成会议总结"""
+        full_text = self.full_transcript.get("1.0", tk.END).strip()
         
         if not full_text:
-            messagebox.showwarning("警告", "请先录音或输入会议内容！")
+            messagebox.showwarning("警告", "没有会议内容可以总结！")
             return
         
-        keyword_labels = []
-        for label in self.keyword_labels:
-            keyword_labels.append(label.cget("text").replace("● ", ""))
-        keywords = ", ".join(keyword_labels)
+        summary = MeetingSummarizer.summarize(full_text)
+        keywords = MeetingSummarizer.extract_keywords(full_text, 15)
+        actions = MeetingSummarizer.extract_action_items(full_text)
         
-        actions = self.action_text.get("1.0", tk.END).strip()
+        summary_window = tk.Toplevel(self.root)
+        summary_window.title("📊 会议总结报告")
+        summary_window.geometry("800x700")
+        summary_window.configure(bg='#f0f2f5')
+        
+        canvas = tk.Canvas(summary_window, bg='#f0f2f5', highlightthickness=0)
+        scrollbar = ttk.Scrollbar(summary_window, orient="vertical", command=canvas.yview)
+        scrollable_frame = tk.Frame(canvas, bg='#f0f2f5')
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side="left", fill="both", expand=True, padx=10, pady=10)
+        scrollbar.pack(side="right", fill="y")
+        
+        tk.Label(scrollable_frame, text="📊 会议总结报告", 
+                font=('Microsoft YaHei UI', 20, 'bold'),
+                bg='#f0f2f5', fg='#1890ff').pack(pady=15)
+        
+        # 基本信息
+        info_frame = tk.LabelFrame(scrollable_frame, text="基本信息", 
+                                  font=('Microsoft YaHei UI', 12, 'bold'),
+                                  bg='white', fg='#333', padx=15, pady=10)
+        info_frame.pack(fill=tk.X, padx=20, pady=10)
+        
+        theme = self.meeting_theme.get() or "未命名会议"
+        attendees = self.meeting_attendees_input.get() or "未记录"
+        
+        tk.Label(info_frame, text=f"会议主题：{theme}", 
+                font=('Microsoft YaHei UI', 11), bg='white', fg='#333').pack(anchor='w', pady=3)
+        tk.Label(info_frame, text=f"参会人员：{attendees}", 
+                font=('Microsoft YaHei UI', 11), bg='white', fg='#333').pack(anchor='w', pady=3)
+        tk.Label(info_frame, text=f"会议时长：{self.timer_label.cget('text')}", 
+                font=('Microsoft YaHei UI', 11), bg='white', fg='#333').pack(anchor='w', pady=3)
+        tk.Label(info_frame, text=f"记录时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", 
+                font=('Microsoft YaHei UI', 11), bg='white', fg='#333').pack(anchor='w', pady=3)
+        
+        # 关键词
+        keyword_frame = tk.LabelFrame(scrollable_frame, text="🔑 核心关键词", 
+                                     font=('Microsoft YaHei UI', 12, 'bold'),
+                                     bg='white', fg='#333', padx=15, pady=10)
+        keyword_frame.pack(fill=tk.X, padx=20, pady=10)
+        
+        keyword_container = tk.Frame(keyword_frame, bg='white')
+        keyword_container.pack(fill=tk.X, pady=5)
+        
+        for keyword in keywords[:12]:
+            tk.Label(keyword_container, text=keyword,
+                    font=('Microsoft YaHei UI', 10, 'bold'),
+                    fg='#1890ff', bg='#e6f7ff',
+                    padx=10, pady=5).pack(side=tk.LEFT, padx=5, pady=3)
+        
+        # 会议总结
+        summary_frame = tk.LabelFrame(scrollable_frame, text="📝 会议总结", 
+                                     font=('Microsoft YaHei UI', 12, 'bold'),
+                                     bg='white', fg='#333', padx=15, pady=10)
+        summary_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        
+        summary_text = scrolledtext.ScrolledText(
+            summary_frame, font=('Microsoft YaHei UI', 11),
+            wrap=tk.WORD, height=10, bg='#fafafa', relief=tk.FLAT,
+            padx=10, pady=10
+        )
+        summary_text.pack(fill=tk.BOTH, expand=True)
+        summary_text.insert(tk.END, summary)
+        summary_text.config(state=tk.DISABLED)
+        
+        # 行动项
+        if actions:
+            action_frame = tk.LabelFrame(scrollable_frame, text="✅ 行动项", 
+                                        font=('Microsoft YaHei UI', 12, 'bold'),
+                                        bg='white', fg='#333', padx=15, pady=10)
+            action_frame.pack(fill=tk.X, padx=20, pady=10)
+            
+            for i, action in enumerate(actions, 1):
+                category = action.get('category', '')
+                text = action.get('text', '')
+                tk.Label(action_frame, text=f"{i}. [{category}] {text}",
+                        font=('Microsoft YaHei UI', 10), bg='white', fg='#333',
+                        wraplength=650, justify='left').pack(anchor='w', pady=3)
+    
+    def save_current_meeting(self):
+        """保存当前会议"""
+        full_text = self.full_transcript.get("1.0", tk.END).strip()
+        
+        if not full_text:
+            messagebox.showwarning("警告", "没有会议内容可以保存！")
+            return
+        
+        theme = self.meeting_theme.get() or "未命名会议"
+        attendees = self.meeting_attendees_input.get() or ""
+        
+        keywords = []
+        for label in self.keyword_labels:
+            keywords.append(label.cget('text'))
+        
+        actions = self.action_items_text.get("1.0", tk.END).strip()
+        duration = self.timer_label.cget('text')
+        
+        summary = MeetingSummarizer.summarize(full_text)
         
         meeting = {
             "id": datetime.now().strftime("%Y%m%d%H%M%S"),
-            "title": title,
-            "time": time_str,
+            "title": theme,
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "attendees": attendees,
+            "duration": duration,
             "full_text": full_text,
             "summary": summary,
-            "keywords": keywords,
+            "keywords": ", ".join(keywords),
             "action_items": actions,
             "created_at": datetime.now().isoformat()
         }
         
         self.records["meetings"].insert(0, meeting)
         self.save_records()
-        self.refresh_meeting_list()
-        self.clear_meeting()
-        messagebox.showinfo("成功", "会议记录已保存！")
+        
+        if hasattr(self, 'meeting_history_tree'):
+            self.refresh_meeting_history()
+        
+        messagebox.showinfo("成功", f"会议已保存！\n\n主题：{theme}\n时长：{duration}")
     
     def clear_meeting(self):
-        self.meeting_title.delete(0, tk.END)
-        self.meeting_time.delete(0, tk.END)
-        self.meeting_time.insert(0, datetime.now().strftime("%Y-%m-%d %H:%M"))
-        self.meeting_attendees.delete(0, tk.END)
-        self.transcribed_text.delete("1.0", tk.END)
-        self.summary_text.delete("1.0", tk.END)
-        self.action_text.delete("1.0", tk.END)
-        for label in self.keyword_labels:
-            label.destroy()
-        self.keyword_labels = []
-        self.recording_text = ""
+        """清空会议内容"""
+        if self.is_meeting_mode:
+            if not messagebox.askyesno("确认", "会议正在进行中，确定要清空吗？"):
+                return
+            self.is_meeting_mode = False
+            self.stop_timer()
+            if self.meeting_recorder:
+                self.meeting_recorder.stop_recording()
+            self.start_meeting_btn.config(text="🎙️ 开始会议", bg='#1890ff', activebackground='#40a9ff')
+            self.meeting_status.config(text="● 待机", fg='#999')
+        
+        if messagebox.askyesno("确认", "确定要清空所有会议内容吗？"):
+            self.full_transcript.delete("1.0", tk.END)
+            self.subtitle_display.clear()
+            self.timer_label.config(text="00:00:00")
+            self.meeting_theme.delete(0, tk.END)
+            self.meeting_attendees_input.delete(0, tk.END)
+            
+            for label in self.keyword_labels:
+                label.destroy()
+            self.keyword_labels = []
+            
+            self.action_items_text.delete("1.0", tk.END)
     
-    def refresh_meeting_list(self):
-        for item in self.meeting_tree.get_children():
-            self.meeting_tree.delete(item)
+    def create_meeting_history_tab(self):
+        """创建会议历史标签页"""
+        frame = tk.Frame(self.notebook, bg='#f0f2f5')
+        self.notebook.add(frame, text="📚 会议历史")
+        
+        list_frame = tk.LabelFrame(frame, text="历史会议记录", 
+                                  font=('Microsoft YaHei UI', 12, 'bold'),
+                                  bg='white', fg='#333', padx=10, pady=10)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        columns = ("time", "title", "attendees", "duration")
+        self.meeting_history_tree = ttk.Treeview(
+            list_frame, columns=columns, show="headings", height=15
+        )
+        self.meeting_history_tree.heading("time", text="时间")
+        self.meeting_history_tree.heading("title", text="主题")
+        self.meeting_history_tree.heading("attendees", text="参会人员")
+        self.meeting_history_tree.heading("duration", text="时长")
+        self.meeting_history_tree.column("time", width=160)
+        self.meeting_history_tree.column("title", width=400)
+        self.meeting_history_tree.column("attendees", width=200)
+        self.meeting_history_tree.column("duration", width=100)
+        
+        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, 
+                                  command=self.meeting_history_tree.yview)
+        self.meeting_history_tree.configure(yscrollcommand=scrollbar.set)
+        
+        self.meeting_history_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        self.meeting_history_tree.bind("<<TreeviewSelect>>", self.show_meeting_history_detail)
+        self.meeting_history_tree.bind("<Double-1>", self.delete_meeting_history)
+        
+        self.refresh_meeting_history()
+    
+    def refresh_meeting_history(self):
+        """刷新会议历史列表"""
+        for item in self.meeting_history_tree.get_children():
+            self.meeting_history_tree.delete(item)
         
         for meeting in self.records["meetings"]:
-            self.meeting_tree.insert("", tk.END, values=(
+            self.meeting_history_tree.insert("", tk.END, values=(
                 meeting.get("time", ""),
                 meeting.get("title", ""),
-                meeting.get("attendees", "")
+                meeting.get("attendees", ""),
+                meeting.get("duration", "")
             ))
     
-    def show_meeting_detail(self, event):
-        selection = self.meeting_tree.selection()
+    def show_meeting_history_detail(self, event):
+        """显示会议历史详情"""
+        selection = self.meeting_history_tree.selection()
         if selection:
-            index = self.meeting_tree.index(selection[0])
+            index = self.meeting_history_tree.index(selection[0])
             if index < len(self.records["meetings"]):
                 meeting = self.records["meetings"][index]
-                detail_window = tk.Toplevel(self.root)
-                detail_window.title(f"会议详情 - {meeting.get('title', '')}")
-                detail_window.geometry("800x600")
-                
-                notebook = ttk.Notebook(detail_window)
-                
-                full_frame = ttk.Frame(notebook)
-                notebook.add(full_frame, text="完整记录")
-                full_text = scrolledtext.ScrolledText(full_frame, width=90, height=30)
-                full_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-                full_text.insert(tk.END, meeting.get("full_text", ""))
-                full_text.config(state=tk.DISABLED)
-                
-                summary_frame = ttk.Frame(notebook)
-                notebook.add(summary_frame, text="总结")
-                summary_text = scrolledtext.ScrolledText(summary_frame, width=90, height=30)
-                summary_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-                summary_text.insert(tk.END, f"关键词: {meeting.get('keywords', '')}\n\n"
-                                        f"行动项:\n{meeting.get('action_items', '')}\n\n"
-                                        f"总结:\n{meeting.get('summary', '')}")
-                summary_text.config(state=tk.DISABLED)
-                
-                notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+                self.show_meeting_detail_window(meeting)
     
-    def delete_meeting(self, event):
-        selection = self.meeting_tree.selection()
+    def show_meeting_detail_window(self, meeting):
+        """显示会议详情窗口"""
+        detail_window = tk.Toplevel(self.root)
+        detail_window.title(f"会议详情 - {meeting.get('title', '')}")
+        detail_window.geometry("1000x700")
+        detail_window.configure(bg='#f0f2f5')
+        
+        notebook = ttk.Notebook(detail_window)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # 完整记录标签
+        full_frame = tk.Frame(notebook, bg='#f0f2f5')
+        notebook.add(full_frame, text="📝 完整记录")
+        
+        full_text = scrolledtext.ScrolledText(
+            full_frame, font=('Microsoft YaHei UI', 11), wrap=tk.WORD,
+            bg='white', padx=10, pady=10
+        )
+        full_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        full_text.insert(tk.END, meeting.get("full_text", ""))
+        full_text.config(state=tk.DISABLED)
+        
+        # 总结标签
+        summary_frame = tk.Frame(notebook, bg='#f0f2f5')
+        notebook.add(summary_frame, text="📊 智能总结")
+        
+        summary_container = tk.Frame(summary_frame, bg='#f0f2f5')
+        summary_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # 关键词
+        kw_frame = tk.LabelFrame(summary_container, text="🔑 关键词", 
+                                font=('Microsoft YaHei UI', 11, 'bold'),
+                                bg='white', fg='#333')
+        kw_frame.pack(fill=tk.X, pady=5)
+        
+        kw_text = meeting.get("keywords", "")
+        if kw_text:
+            kw_list = kw_text.split(", ")
+            kw_box = tk.Frame(kw_frame, bg='white')
+            kw_box.pack(fill=tk.X, padx=10, pady=10)
+            for kw in kw_list:
+                tk.Label(kw_box, text=kw.strip(),
+                        font=('Microsoft YaHei UI', 10, 'bold'),
+                        fg='#1890ff', bg='#e6f7ff',
+                        padx=10, pady=5).pack(side=tk.LEFT, padx=5, pady=3)
+        
+        # 行动项
+        act_frame = tk.LabelFrame(summary_container, text="✅ 行动项", 
+                                 font=('Microsoft YaHei UI', 11, 'bold'),
+                                 bg='white', fg='#333')
+        act_frame.pack(fill=tk.X, pady=5)
+        
+        act_text_widget = scrolledtext.ScrolledText(
+            act_frame, font=('Microsoft YaHei UI', 10), height=6,
+            bg='#fafafa', padx=10, pady=10
+        )
+        act_text_widget.pack(fill=tk.X, padx=10, pady=10)
+        act_text_widget.insert(tk.END, meeting.get("action_items", "暂无"))
+        act_text_widget.config(state=tk.DISABLED)
+        
+        # 总结内容
+        sum_frame = tk.LabelFrame(summary_container, text="📝 会议总结", 
+                                 font=('Microsoft YaHei UI', 11, 'bold'),
+                                 bg='white', fg='#333')
+        sum_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        sum_text = scrolledtext.ScrolledText(
+            sum_frame, font=('Microsoft YaHei UI', 11),
+            bg='#fafafa', padx=10, pady=10
+        )
+        sum_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        sum_text.insert(tk.END, meeting.get("summary", ""))
+        sum_text.config(state=tk.DISABLED)
+    
+    def delete_meeting_history(self, event):
+        """删除会议历史记录"""
+        selection = self.meeting_history_tree.selection()
         if selection:
             if messagebox.askyesno("确认", "确定要删除这条会议记录吗？"):
-                index = self.meeting_tree.index(selection[0])
+                index = self.meeting_history_tree.index(selection[0])
                 if index < len(self.records["meetings"]):
                     del self.records["meetings"][index]
                     self.save_records()
-                    self.refresh_meeting_list()
+                    self.refresh_meeting_history()
     
     def create_work_tab(self):
-        frame = ttk.Frame(self.notebook)
+        frame = tk.Frame(self.notebook, bg='#f0f2f5')
         self.notebook.add(frame, text="📝 工作内容")
         
-        input_frame = ttk.LabelFrame(frame, text="新增工作记录")
+        input_frame = tk.LabelFrame(frame, text="新增工作记录", 
+                                   font=('Microsoft YaHei UI', 12, 'bold'),
+                                   bg='white', fg='#333', padx=10, pady=10)
         input_frame.pack(fill=tk.X, padx=10, pady=10)
         
-        ttk.Label(input_frame, text="工作主题:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
-        self.work_title = ttk.Entry(input_frame, width=50)
-        self.work_title.grid(row=0, column=1, padx=5, pady=5, sticky=tk.W)
+        tk.Label(input_frame, text="工作主题:", font=('Microsoft YaHei UI', 10), 
+                bg='white', fg='#333').grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
+        self.work_title = tk.Entry(input_frame, width=60, font=('Microsoft YaHei UI', 10),
+                                  relief=tk.FLAT, bg='#f6f6f6')
+        self.work_title.grid(row=0, column=1, padx=5, pady=5, sticky=tk.W, ipady=5)
         
-        ttk.Label(input_frame, text="工作日期:").grid(row=1, column=0, padx=5, pady=5, sticky=tk.W)
-        self.work_date = ttk.Entry(input_frame, width=50)
+        tk.Label(input_frame, text="工作日期:", font=('Microsoft YaHei UI', 10), 
+                bg='white', fg='#333').grid(row=1, column=0, padx=5, pady=5, sticky=tk.W)
+        self.work_date = tk.Entry(input_frame, width=60, font=('Microsoft YaHei UI', 10),
+                                 relief=tk.FLAT, bg='#f6f6f6')
         self.work_date.insert(0, datetime.now().strftime("%Y-%m-%d"))
-        self.work_date.grid(row=1, column=1, padx=5, pady=5, sticky=tk.W)
+        self.work_date.grid(row=1, column=1, padx=5, pady=5, sticky=tk.W, ipady=5)
         
-        ttk.Label(input_frame, text="工作内容:").grid(row=2, column=0, padx=5, pady=5, sticky=tk.NW)
-        self.work_content = scrolledtext.ScrolledText(input_frame, width=60, height=8)
+        tk.Label(input_frame, text="工作内容:", font=('Microsoft YaHei UI', 10), 
+                bg='white', fg='#333').grid(row=2, column=0, padx=5, pady=5, sticky=tk.NW)
+        self.work_content = scrolledtext.ScrolledText(input_frame, width=70, height=8,
+                                                     font=('Microsoft YaHei UI', 10),
+                                                     relief=tk.FLAT, bg='#f6f6f6')
         self.work_content.grid(row=2, column=1, padx=5, pady=5, sticky=tk.W)
         
-        btn_frame = ttk.Frame(input_frame)
+        btn_frame = tk.Frame(input_frame, bg='white')
         btn_frame.grid(row=3, column=0, columnspan=2, pady=10)
-        ttk.Button(btn_frame, text="保存记录", command=self.save_work).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="清空内容", command=self.clear_work).pack(side=tk.LEFT, padx=5)
         
-        list_frame = ttk.LabelFrame(frame, text="历史工作记录")
+        tk.Button(btn_frame, text="保存记录", font=('Microsoft YaHei UI', 10),
+                 bg='#1890ff', fg='white', relief=tk.FLAT, cursor='hand2',
+                 command=self.save_work, width=15, height=2
+                 ).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="清空内容", font=('Microsoft YaHei UI', 10),
+                 bg='#ff4d4f', fg='white', relief=tk.FLAT, cursor='hand2',
+                 command=self.clear_work, width=15, height=2
+                 ).pack(side=tk.LEFT, padx=5)
+        
+        list_frame = tk.LabelFrame(frame, text="历史工作记录", 
+                                  font=('Microsoft YaHei UI', 12, 'bold'),
+                                  bg='white', fg='#333', padx=10, pady=10)
         list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
         columns = ("date", "title", "preview")
@@ -526,7 +1123,7 @@ class WorkAssistant:
         self.work_tree.heading("preview", text="内容预览")
         self.work_tree.column("date", width=120)
         self.work_tree.column("title", width=200)
-        self.work_tree.column("preview", width=350)
+        self.work_tree.column("preview", width=400)
         
         scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.work_tree.yview)
         self.work_tree.configure(yscrollcommand=scrollbar.set)
@@ -590,7 +1187,8 @@ class WorkAssistant:
                 detail_window.title("工作详情")
                 detail_window.geometry("600x400")
                 
-                text = scrolledtext.ScrolledText(detail_window, width=70, height=20)
+                text = scrolledtext.ScrolledText(detail_window, width=70, height=20,
+                                                 font=('Microsoft YaHei UI', 10))
                 text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
                 text.insert(tk.END, f"工作主题: {work.get('title', '')}\n")
                 text.insert(tk.END, f"工作日期: {work.get('date', '')}\n")
@@ -608,31 +1206,49 @@ class WorkAssistant:
                     self.refresh_work_list()
     
     def create_detail_tab(self):
-        frame = ttk.Frame(self.notebook)
+        frame = tk.Frame(self.notebook, bg='#f0f2f5')
         self.notebook.add(frame, text="🔍 工作细节")
         
-        input_frame = ttk.LabelFrame(frame, text="新增工作细节")
+        input_frame = tk.LabelFrame(frame, text="新增工作细节", 
+                                   font=('Microsoft YaHei UI', 12, 'bold'),
+                                   bg='white', fg='#333', padx=10, pady=10)
         input_frame.pack(fill=tk.X, padx=10, pady=10)
         
-        ttk.Label(input_frame, text="细节主题:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
-        self.detail_title = ttk.Entry(input_frame, width=50)
-        self.detail_title.grid(row=0, column=1, padx=5, pady=5, sticky=tk.W)
+        tk.Label(input_frame, text="细节主题:", font=('Microsoft YaHei UI', 10), 
+                bg='white', fg='#333').grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
+        self.detail_title = tk.Entry(input_frame, width=60, font=('Microsoft YaHei UI', 10),
+                                    relief=tk.FLAT, bg='#f6f6f6')
+        self.detail_title.grid(row=0, column=1, padx=5, pady=5, sticky=tk.W, ipady=5)
         
-        ttk.Label(input_frame, text="记录时间:").grid(row=1, column=0, padx=5, pady=5, sticky=tk.W)
-        self.detail_time = ttk.Entry(input_frame, width=50)
+        tk.Label(input_frame, text="记录时间:", font=('Microsoft YaHei UI', 10), 
+                bg='white', fg='#333').grid(row=1, column=0, padx=5, pady=5, sticky=tk.W)
+        self.detail_time = tk.Entry(input_frame, width=60, font=('Microsoft YaHei UI', 10),
+                                   relief=tk.FLAT, bg='#f6f6f6')
         self.detail_time.insert(0, datetime.now().strftime("%Y-%m-%d %H:%M"))
-        self.detail_time.grid(row=1, column=1, padx=5, pady=5, sticky=tk.W)
+        self.detail_time.grid(row=1, column=1, padx=5, pady=5, sticky=tk.W, ipady=5)
         
-        ttk.Label(input_frame, text="详细内容:").grid(row=2, column=0, padx=5, pady=5, sticky=tk.NW)
-        self.detail_content = scrolledtext.ScrolledText(input_frame, width=60, height=8)
+        tk.Label(input_frame, text="详细内容:", font=('Microsoft YaHei UI', 10), 
+                bg='white', fg='#333').grid(row=2, column=0, padx=5, pady=5, sticky=tk.NW)
+        self.detail_content = scrolledtext.ScrolledText(input_frame, width=70, height=8,
+                                                       font=('Microsoft YaHei UI', 10),
+                                                       relief=tk.FLAT, bg='#f6f6f6')
         self.detail_content.grid(row=2, column=1, padx=5, pady=5, sticky=tk.W)
         
-        btn_frame = ttk.Frame(input_frame)
+        btn_frame = tk.Frame(input_frame, bg='white')
         btn_frame.grid(row=3, column=0, columnspan=2, pady=10)
-        ttk.Button(btn_frame, text="保存记录", command=self.save_detail).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="清空内容", command=self.clear_detail).pack(side=tk.LEFT, padx=5)
         
-        list_frame = ttk.LabelFrame(frame, text="历史细节记录")
+        tk.Button(btn_frame, text="保存记录", font=('Microsoft YaHei UI', 10),
+                 bg='#1890ff', fg='white', relief=tk.FLAT, cursor='hand2',
+                 command=self.save_detail, width=15, height=2
+                 ).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="清空内容", font=('Microsoft YaHei UI', 10),
+                 bg='#ff4d4f', fg='white', relief=tk.FLAT, cursor='hand2',
+                 command=self.clear_detail, width=15, height=2
+                 ).pack(side=tk.LEFT, padx=5)
+        
+        list_frame = tk.LabelFrame(frame, text="历史细节记录", 
+                                  font=('Microsoft YaHei UI', 12, 'bold'),
+                                  bg='white', fg='#333', padx=10, pady=10)
         list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
         columns = ("time", "title", "preview")
@@ -642,7 +1258,7 @@ class WorkAssistant:
         self.detail_tree.heading("preview", text="内容预览")
         self.detail_tree.column("time", width=150)
         self.detail_tree.column("title", width=200)
-        self.detail_tree.column("preview", width=320)
+        self.detail_tree.column("preview", width=370)
         
         scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.detail_tree.yview)
         self.detail_tree.configure(yscrollcommand=scrollbar.set)
@@ -706,7 +1322,8 @@ class WorkAssistant:
                 detail_window.title("工作细节详情")
                 detail_window.geometry("600x400")
                 
-                text = scrolledtext.ScrolledText(detail_window, width=70, height=20)
+                text = scrolledtext.ScrolledText(detail_window, width=70, height=20,
+                                                 font=('Microsoft YaHei UI', 10))
                 text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
                 text.insert(tk.END, f"细节主题: {detail.get('title', '')}\n")
                 text.insert(tk.END, f"记录时间: {detail.get('time', '')}\n")
@@ -724,36 +1341,55 @@ class WorkAssistant:
                     self.refresh_detail_list()
     
     def create_improvement_tab(self):
-        frame = ttk.Frame(self.notebook)
+        frame = tk.Frame(self.notebook, bg='#f0f2f5')
         self.notebook.add(frame, text="💡 改进建议")
         
-        input_frame = ttk.LabelFrame(frame, text="新增改进建议")
+        input_frame = tk.LabelFrame(frame, text="新增改进建议", 
+                                   font=('Microsoft YaHei UI', 12, 'bold'),
+                                   bg='white', fg='#333', padx=10, pady=10)
         input_frame.pack(fill=tk.X, padx=10, pady=10)
         
-        ttk.Label(input_frame, text="改进主题:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
-        self.improvement_title = ttk.Entry(input_frame, width=50)
-        self.improvement_title.grid(row=0, column=1, padx=5, pady=5, sticky=tk.W)
+        tk.Label(input_frame, text="改进主题:", font=('Microsoft YaHei UI', 10), 
+                bg='white', fg='#333').grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
+        self.improvement_title = tk.Entry(input_frame, width=60, font=('Microsoft YaHei UI', 10),
+                                         relief=tk.FLAT, bg='#f6f6f6')
+        self.improvement_title.grid(row=0, column=1, padx=5, pady=5, sticky=tk.W, ipady=5)
         
-        ttk.Label(input_frame, text="提出日期:").grid(row=1, column=0, padx=5, pady=5, sticky=tk.W)
-        self.improvement_date = ttk.Entry(input_frame, width=50)
+        tk.Label(input_frame, text="提出日期:", font=('Microsoft YaHei UI', 10), 
+                bg='white', fg='#333').grid(row=1, column=0, padx=5, pady=5, sticky=tk.W)
+        self.improvement_date = tk.Entry(input_frame, width=60, font=('Microsoft YaHei UI', 10),
+                                        relief=tk.FLAT, bg='#f6f6f6')
         self.improvement_date.insert(0, datetime.now().strftime("%Y-%m-%d"))
-        self.improvement_date.grid(row=1, column=1, padx=5, pady=5, sticky=tk.W)
+        self.improvement_date.grid(row=1, column=1, padx=5, pady=5, sticky=tk.W, ipady=5)
         
-        ttk.Label(input_frame, text="改进内容:").grid(row=2, column=0, padx=5, pady=5, sticky=tk.NW)
-        self.improvement_content = scrolledtext.ScrolledText(input_frame, width=60, height=8)
+        tk.Label(input_frame, text="改进内容:", font=('Microsoft YaHei UI', 10), 
+                bg='white', fg='#333').grid(row=2, column=0, padx=5, pady=5, sticky=tk.NW)
+        self.improvement_content = scrolledtext.ScrolledText(input_frame, width=70, height=8,
+                                                           font=('Microsoft YaHei UI', 10),
+                                                           relief=tk.FLAT, bg='#f6f6f6')
         self.improvement_content.grid(row=2, column=1, padx=5, pady=5, sticky=tk.W)
         
-        ttk.Label(input_frame, text="状态:").grid(row=3, column=0, padx=5, pady=5, sticky=tk.W)
-        self.improvement_status = ttk.Combobox(input_frame, values=["待处理", "进行中", "已完成"], width=47)
+        tk.Label(input_frame, text="状态:", font=('Microsoft YaHei UI', 10), 
+                bg='white', fg='#333').grid(row=3, column=0, padx=5, pady=5, sticky=tk.W)
+        self.improvement_status = ttk.Combobox(input_frame, values=["待处理", "进行中", "已完成"], width=57)
         self.improvement_status.set("待处理")
         self.improvement_status.grid(row=3, column=1, padx=5, pady=5, sticky=tk.W)
         
-        btn_frame = ttk.Frame(input_frame)
+        btn_frame = tk.Frame(input_frame, bg='white')
         btn_frame.grid(row=4, column=0, columnspan=2, pady=10)
-        ttk.Button(btn_frame, text="保存记录", command=self.save_improvement).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="清空内容", command=self.clear_improvement).pack(side=tk.LEFT, padx=5)
         
-        list_frame = ttk.LabelFrame(frame, text="历史改进记录")
+        tk.Button(btn_frame, text="保存记录", font=('Microsoft YaHei UI', 10),
+                 bg='#1890ff', fg='white', relief=tk.FLAT, cursor='hand2',
+                 command=self.save_improvement, width=15, height=2
+                 ).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="清空内容", font=('Microsoft YaHei UI', 10),
+                 bg='#ff4d4f', fg='white', relief=tk.FLAT, cursor='hand2',
+                 command=self.clear_improvement, width=15, height=2
+                 ).pack(side=tk.LEFT, padx=5)
+        
+        list_frame = tk.LabelFrame(frame, text="历史改进记录", 
+                                  font=('Microsoft YaHei UI', 12, 'bold'),
+                                  bg='white', fg='#333', padx=10, pady=10)
         list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
         columns = ("date", "title", "status", "preview")
@@ -765,7 +1401,7 @@ class WorkAssistant:
         self.improvement_tree.column("date", width=120)
         self.improvement_tree.column("title", width=150)
         self.improvement_tree.column("status", width=80)
-        self.improvement_tree.column("preview", width=320)
+        self.improvement_tree.column("preview", width=370)
         
         scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.improvement_tree.yview)
         self.improvement_tree.configure(yscrollcommand=scrollbar.set)
@@ -833,7 +1469,8 @@ class WorkAssistant:
                 detail_window.title("改进建议详情")
                 detail_window.geometry("600x400")
                 
-                text = scrolledtext.ScrolledText(detail_window, width=70, height=20)
+                text = scrolledtext.ScrolledText(detail_window, width=70, height=20,
+                                                 font=('Microsoft YaHei UI', 10))
                 text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
                 text.insert(tk.END, f"改进主题: {improvement.get('title', '')}\n")
                 text.insert(tk.END, f"提出日期: {improvement.get('date', '')}\n")
@@ -852,36 +1489,54 @@ class WorkAssistant:
                     self.refresh_improvement_list()
     
     def create_reminder_tab(self):
-        frame = ttk.Frame(self.notebook)
+        frame = tk.Frame(self.notebook, bg='#f0f2f5')
         self.notebook.add(frame, text="⏰ 会议提醒")
         
-        input_frame = ttk.LabelFrame(frame, text="新增会议提醒")
+        input_frame = tk.LabelFrame(frame, text="新增会议提醒", 
+                                   font=('Microsoft YaHei UI', 12, 'bold'),
+                                   bg='white', fg='#333', padx=10, pady=10)
         input_frame.pack(fill=tk.X, padx=10, pady=10)
         
-        ttk.Label(input_frame, text="会议主题:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
-        self.reminder_title = ttk.Entry(input_frame, width=50)
-        self.reminder_title.grid(row=0, column=1, padx=5, pady=5, sticky=tk.W)
+        tk.Label(input_frame, text="会议主题:", font=('Microsoft YaHei UI', 10), 
+                bg='white', fg='#333').grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
+        self.reminder_title = tk.Entry(input_frame, width=60, font=('Microsoft YaHei UI', 10),
+                                      relief=tk.FLAT, bg='#f6f6f6')
+        self.reminder_title.grid(row=0, column=1, padx=5, pady=5, sticky=tk.W, ipady=5)
         
-        ttk.Label(input_frame, text="会议时间:").grid(row=1, column=0, padx=5, pady=5, sticky=tk.W)
-        self.reminder_time = ttk.Entry(input_frame, width=50)
+        tk.Label(input_frame, text="会议时间:", font=('Microsoft YaHei UI', 10), 
+                bg='white', fg='#333').grid(row=1, column=0, padx=5, pady=5, sticky=tk.W)
+        self.reminder_time = tk.Entry(input_frame, width=60, font=('Microsoft YaHei UI', 10),
+                                     relief=tk.FLAT, bg='#f6f6f6')
         self.reminder_time.insert(0, datetime.now().strftime("%Y-%m-%d %H:%M"))
-        self.reminder_time.grid(row=1, column=1, padx=5, pady=5, sticky=tk.W)
+        self.reminder_time.grid(row=1, column=1, padx=5, pady=5, sticky=tk.W, ipady=5)
         
-        ttk.Label(input_frame, text="提前提醒:").grid(row=2, column=0, padx=5, pady=5, sticky=tk.W)
-        self.reminder_advance = ttk.Combobox(input_frame, values=["5分钟", "10分钟", "15分钟", "30分钟", "1小时"], width=47)
+        tk.Label(input_frame, text="提前提醒:", font=('Microsoft YaHei UI', 10), 
+                bg='white', fg='#333').grid(row=2, column=0, padx=5, pady=5, sticky=tk.W)
+        self.reminder_advance = ttk.Combobox(input_frame, values=["5分钟", "10分钟", "15分钟", "30分钟", "1小时"], width=57)
         self.reminder_advance.set("15分钟")
         self.reminder_advance.grid(row=2, column=1, padx=5, pady=5, sticky=tk.W)
         
-        ttk.Label(input_frame, text="备注:").grid(row=3, column=0, padx=5, pady=5, sticky=tk.W)
-        self.reminder_note = ttk.Entry(input_frame, width=50)
-        self.reminder_note.grid(row=3, column=1, padx=5, pady=5, sticky=tk.W)
+        tk.Label(input_frame, text="备注:", font=('Microsoft YaHei UI', 10), 
+                bg='white', fg='#333').grid(row=3, column=0, padx=5, pady=5, sticky=tk.W)
+        self.reminder_note = tk.Entry(input_frame, width=60, font=('Microsoft YaHei UI', 10),
+                                     relief=tk.FLAT, bg='#f6f6f6')
+        self.reminder_note.grid(row=3, column=1, padx=5, pady=5, sticky=tk.W, ipady=5)
         
-        btn_frame = ttk.Frame(input_frame)
+        btn_frame = tk.Frame(input_frame, bg='white')
         btn_frame.grid(row=4, column=0, columnspan=2, pady=10)
-        ttk.Button(btn_frame, text="添加提醒", command=self.add_reminder).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="清空内容", command=self.clear_reminder).pack(side=tk.LEFT, padx=5)
         
-        list_frame = ttk.LabelFrame(frame, text="已设置的提醒")
+        tk.Button(btn_frame, text="添加提醒", font=('Microsoft YaHei UI', 10),
+                 bg='#1890ff', fg='white', relief=tk.FLAT, cursor='hand2',
+                 command=self.add_reminder, width=15, height=2
+                 ).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="清空内容", font=('Microsoft YaHei UI', 10),
+                 bg='#ff4d4f', fg='white', relief=tk.FLAT, cursor='hand2',
+                 command=self.clear_reminder, width=15, height=2
+                 ).pack(side=tk.LEFT, padx=5)
+        
+        list_frame = tk.LabelFrame(frame, text="已设置的提醒", 
+                                  font=('Microsoft YaHei UI', 12, 'bold'),
+                                  bg='white', fg='#333', padx=10, pady=10)
         list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
         columns = ("time", "title", "advance", "note")
@@ -890,10 +1545,10 @@ class WorkAssistant:
         self.reminder_tree.heading("title", text="主题")
         self.reminder_tree.heading("advance", text="提前提醒")
         self.reminder_tree.heading("note", text="备注")
-        self.reminder_tree.column("time", width=150)
-        self.reminder_tree.column("title", width=200)
+        self.reminder_tree.column("time", width=160)
+        self.reminder_tree.column("title", width=250)
         self.reminder_tree.column("advance", width=100)
-        self.reminder_tree.column("note", width=200)
+        self.reminder_tree.column("note", width=250)
         
         scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.reminder_tree.yview)
         self.reminder_tree.configure(yscrollcommand=scrollbar.set)
@@ -985,11 +1640,10 @@ class WorkAssistant:
                                     reminder["notified"] = True
                                     self.save_config()
                             except Exception as e:
-                                print(f"提醒检查错误: {e}")
+                                pass
                     
                     time.sleep(30)
                 except Exception as e:
-                    print(f"提醒服务错误: {e}")
                     time.sleep(30)
         
         self.reminder_thread = threading.Thread(target=check_reminders, daemon=True)
@@ -1004,21 +1658,11 @@ class WorkAssistant:
                 f"时间: {reminder.get('time', '')}\n"
                 f"备注: {reminder.get('note', '')}"
             )
-        
         self.root.after(0, popup)
     
-    def create_status_bar(self):
-        status_frame = ttk.Frame(self.root)
-        status_frame.pack(fill=tk.X, side=tk.BOTTOM, padx=10, pady=5)
-        
-        self.status_label = ttk.Label(status_frame, text="就绪")
-        self.status_label.pack(side=tk.LEFT)
-        
-        ttk.Label(status_frame, text=f"当前时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}").pack(side=tk.RIGHT)
-    
     def on_closing(self):
-        if self.is_recording and self.voice_recorder:
-            self.voice_recorder.stop_recording()
+        if self.is_meeting_mode and self.meeting_recorder:
+            self.meeting_recorder.stop_recording()
         self.reminder_running = False
         self.root.destroy()
 

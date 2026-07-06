@@ -4,12 +4,16 @@
 
 工作助手是一个专为职场人士设计的**专业级智能会议记录应用**，具备**实时语音识别**、**自动文字纠错**、**智能字幕显示**和**AI智能总结**功能。应用能够自动听会议中的说话内容，实时转换为精准文字，自动纠错和添加标点，并生成美观的会议记录和智能分析报告，全程无需人工干预。
 
+**支持平台**:
+- 🖥️ Windows / macOS / Linux（桌面版本）
+- 📱 Android（移动版本）
+
 ## 版本信息
 
 **版本**: 3.0.0  
 **发布日期**: 2026-07-06  
 **开发语言**: Python 3  
-**界面**: 现代化 Tkinter GUI  
+**界面**: 现代化 Tkinter GUI（桌面）/ Kivy（安卓）  
 **语音识别**: Google Speech Recognition API  
 **文字处理**: 自动纠错 + 智能标点 + 格式优化  
 **智能总结**: NLTK + TF-IDF 算法
@@ -26,7 +30,7 @@
 - 🔍 **优化识别准确率** - 多重后处理，提升文字质量
 - 📊 **升级智能总结** - 更精准的关键词和行动项提取
 - 💾 **完善会议历史** - 独立历史记录页面，方便查看
-- 🎯 **专注模式** - 减少干扰，专注会议内容
+- 📱 **新增安卓版本** - Kivy框架开发，支持安卓手机运行
 
 ### v2.0.0 (2026-07-06)
 - 🎤 **新增语音自动识别功能** - 实时将会议语音转换为文字
@@ -124,10 +128,16 @@
 
 ```
 工作助手应用/
-├── work_assistant.py       # 主应用程序（核心代码）
+├── work_assistant.py       # 桌面主应用程序（Tkinter）
 ├── data/                   # 数据存储目录
 │   ├── records.json        # 会议、工作、细节、改进记录
 │   └── config.json         # 配置文件和提醒设置
+├── android_app/            # 安卓版本目录
+│   ├── main.py             # 安卓主应用程序（Kivy）
+│   ├── buildozer.spec      # Buildozer配置文件
+│   ├── build_apk.sh        # 安卓一键打包脚本
+│   ├── ANDROID_BUILD.md    # 安卓构建指南
+│   └── data/               # 安卓数据目录
 ├── build_app.sh            # 打包脚本（macOS）
 ├── build_zip.sh            # ZIP打包脚本（通用）
 └── README.md               # 项目文档
@@ -229,6 +239,36 @@ chmod +x build_zip.sh
 ```
 
 2. 解压生成的 ZIP 文件，运行其中的 `work_assistant.py`
+
+### 方法四：构建安卓版本
+
+详细的安卓构建指南请查看 [ANDROID_BUILD.md](file:///workspace/android_app/ANDROID_BUILD.md)
+
+**快速构建步骤：**
+
+1. 进入安卓应用目录
+```bash
+cd android_app
+```
+
+2. 安装构建依赖
+```bash
+pip3 install buildozer kivy SpeechRecognition
+```
+
+3. 运行打包脚本
+```bash
+chmod +x build_apk.sh
+./build_apk.sh
+```
+
+4. 构建成功后，APK 文件位于 `bin/` 目录
+
+**环境要求：**
+- Python 3.8+
+- Java JDK 11+
+- Android SDK（首次构建自动下载）
+- 推荐系统：Ubuntu 20.04+/macOS 11+/Windows 10+
 
 ## 使用指南
 
